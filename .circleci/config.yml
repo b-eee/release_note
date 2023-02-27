@@ -1,0 +1,172 @@
+version: 2.1
+
+discord-notify: &discord-notify
+    post-steps:
+      - discord/status:
+          fail_only: false
+          failure_mentions: '973768753911324692,941150618138079262'
+
+orbs:
+  aws-ecr: circleci/aws-ecr@7.0.0
+  aws-eks: circleci/aws-eks@2.2.0
+  slack: circleci/slack@4.4.2
+  docker: circleci/docker@2.0.1
+  discord: teka23/discord@0.0.1
+
+jobs:
+  notify-on-start:
+    parallelism: 1
+    docker:
+      - image: 'cimg/base:stable'
+    steps:
+      - discord/notify:
+          color: '4383476'
+          message: 'The job on CircleCI has started.'
+
+  notify-on-success:
+    parallelism: 1
+    docker:
+      - image: 'cimg/base:stable'
+    steps:
+      - discord/notify:
+          color: '4383476'
+          message: 'The job on CircleCI has completed.'
+
+  build-docker-image:
+    machine: true
+    resource_class: hexabase-dev/ci-runner
+    steps:
+      - checkout
+      - docker/build:
+          image: $IMG_URL/devdoc
+          dockerfile: docker/app/Dockerfile
+          tag: ${CIRCLE_SHA1:0:7}
+      - run:
+          name: Publish Docker Image to Docker Hub
+          command: |
+            echo "$DOCKER_PASSWORD" | docker login -u "$DOCKER_LOGIN" --password-stdin
+            docker push $IMG_URL/devdoc:${CIRCLE_SHA1:0:7}
+
+  gke-update-image:
+    machine: true
+    resource_class: hexabase-dev/ci-runner
+    steps:
+      - gcp-gke/update-kubeconfig-with-credentials:
+          cluster: $EKS_CLUSTER_NAME
+          perform-login: true
+          install-kubectl: true
+      - run:
+         name: Update k8s deployment
+         command: |
+           kubectl set image deployment/devdoc beee-devdoc=$IMG_URL/devdoc:${CIRCLE_SHA1:0:7}
+           kubectl rollout status deployment/devdoc -w
+
+workflows:
+  build-dockerhub-deploy-eks:
+    jobs:
+      - notify-on-start:
+          filters:
+              branches:
+                only:
+                  - test
+                  - deploy
+                  - master
+          context: discord-webhook
+
+      - build-docker-image:
+          filters:
+              branches:
+                only:
+                  - test
+                  - deploy
+                  - master
+          context: hexa-<< pipeline.git.branch >>
+          <<: *discord-notify
+
+      - aws-eks/update-container-image:
+          name: deploy-to-staging
+          requires:
+            - build-docker-image
+          filters:
+              branches:
+                only:
+                  - deploy
+          context: hexa-deploy
+          cluster-name: $EKS_CLUSTER_NAME
+          aws-region: $AWS_REGION
+          resource-name: "deployment/devdoc"
+          container-image-updates: "beee-devdoc=$IMG_URL/devdoc:${CIRCLE_SHA1:0:7}"
+          get-rollout-status: true
+          watch-rollout-status: true
+          namespace: default
+          <<: *discord-notify
+
+      - notify-on-success:
+          name: notify-on-success-staging
+          requires:
+            - deploy-to-staging
+          context: discord-webhook
+
+      - aws-eks/update-container-image:
+          name: deploy-to-test-ou
+          requires:
+            - build-docker-image
+          filters:
+              branches:
+                only:
+                  - test
+          context: hexa-test
+          cluster-name: $EKS_CLUSTER_NAME
+          aws-region: $AWS_REGION
+          resource-name: "deployment/devdoc"
+          container-image-updates: "beee-devdoc=$IMG_URL/devdoc:${CIRCLE_SHA1:0:7}"
+          get-rollout-status: true
+          watch-rollout-status: true
+          namespace: hexabase
+          <<: *discord-notify
+
+      - notify-on-success:
+          name: notify-on-success-test-ou
+          requires:
+            - deploy-to-test-ou
+          context: discord-webhook
+
+      - discord/approval-notification:
+          mentions: '973768753911324692,941150618138079262'
+          context: hexa-master
+          requires:
+            - build-docker-image
+          filters:
+            branches:
+              only:
+                - master
+
+      - hold:
+          type: approval
+          requires:
+            - build-docker-image
+            - discord/approval-notification
+          filters:
+            branches:
+              only:
+                - master
+
+      - aws-eks/update-container-image:
+          name: deploy-to-prod
+          requires:
+            - hold
+          context: hexa-master
+          cluster-name: $EKS_CLUSTER_NAME
+          aws-region: $AWS_REGION
+          resource-name: "deployment/devdoc"
+          container-image-updates: "beee-devdoc=$IMG_URL/devdoc:${CIRCLE_SHA1:0:7}"
+          get-rollout-status: true
+          watch-rollout-status: true
+          namespace: default
+          <<: *discord-notify
+
+      - notify-on-success:
+          name: notify-on-success-prod
+          requires:
+            - deploy-to-prod
+          context: discord-webhook
